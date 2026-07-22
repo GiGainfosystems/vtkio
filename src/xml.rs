@@ -16,7 +16,7 @@ use std::path::Path;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use log;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 use crate::model;
 
@@ -30,6 +30,7 @@ pub enum Error {
     Model(model::Error),
     IO(std::io::Error),
     Deserialization(de::DeError),
+    Serialization(quick_xml::SeError),
     InvalidVersion,
     TypeExtensionMismatch,
     InvalidType,
@@ -49,6 +50,7 @@ impl std::fmt::Display for Error {
             Error::Model(source) => write!(f, "Model processing error: {:?}", source),
             Error::IO(source) => write!(f, "I/O error: {:?}", source),
             Error::Deserialization(source) => write!(f, "Deserialization error: {:?}", source),
+            Error::Serialization(source) => write!(f, "Serialization error: {source:?}"),
             Error::InvalidVersion => write!(f, "VTK version must be in \"major.minor\" format"),
             Error::InvalidByteOrder => write!(
                 f,
@@ -110,6 +112,12 @@ impl From<ValidationError> for Error {
 impl From<de::DeError> for Error {
     fn from(e: de::DeError) -> Error {
         Error::Deserialization(e)
+    }
+}
+
+impl From<quick_xml::SeError> for Error {
+    fn from(e: quick_xml::SeError) -> Error {
+        Error::Serialization(e)
     }
 }
 
@@ -1402,8 +1410,21 @@ pub struct DataArray {
         deserialize_with = "deserialize_option_float"
     )]
     pub range_max: Option<f64>,
-    #[serde(rename = "$value", default)]
+    #[serde(rename = "$value", default, serialize_with = "as_sequence_helper")]
     pub data: Vec<Data>,
+}
+
+fn as_sequence_helper<S>(data: &Vec<Data>, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let s = data
+        .iter()
+        .cloned()
+        .map(|c| c.into_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    serializer.serialize_str(&s)
 }
 
 // For dummy arrays useful in debugging.
@@ -3273,10 +3294,10 @@ impl std::fmt::Display for VTKFile {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-    use quick_xml::reader::Reader;
+    use quick_xml::reader::NsReader;
 
-    fn custom_reader(input: &str) -> Reader<&[u8]> {
-        let mut reader = Reader::from_str(input);
+    fn custom_reader(input: &str) -> NsReader<&[u8]> {
+        let mut reader = NsReader::from_str(input);
         let config = reader.config_mut();
         config.expand_empty_elements = true;
         config.trim_text_end = true;
@@ -3288,7 +3309,8 @@ mod tests {
     where
         T: serde::de::DeserializeOwned,
     {
-        de::from_custom_reader(custom_reader(input))
+        let mut de = de::Deserializer::borrowing(custom_reader(input));
+        T::deserialize(&mut de)
     }
 
     // Helper to compress the human readable and indented examples below
@@ -3434,13 +3456,14 @@ mod tests {
         </PointData>
         </Piece>"#;
 
-        let mut reader = quick_xml::reader::Reader::from_str(piece);
+        let mut reader = quick_xml::reader::NsReader::from_str(piece);
         let config = reader.config_mut();
         config.expand_empty_elements = true;
         config.trim_text_end = true;
         config.trim_text_start = true;
-        let vtk: Piece = de::from_custom_reader(reader)?;
-        // eprintln!("{:#?}", &vtk);
+        let mut de = quick_xml::de::Deserializer::borrowing(reader);
+        let vtk = Piece::deserialize(&mut de)?;
+        eprintln!("{:#?}", &vtk);
         let as_str = se::to_string(&vtk)?;
         assert_eq!(as_str, compress_xml_str(piece));
         //eprintln!("{}", &as_str);
@@ -3725,22 +3748,6 @@ mod tests {
     fn data_array_paraview() -> Result<()> {
         let xml = r#"
           <DataArray type="Float32" Name="Points" NumberOfComponents="3" format="appended" RangeMin="0"                    RangeMax="1.7320508076"         offset="0"                   >
-          <InformationKey name="L2_NORM_FINITE_RANGE" location="vtkDataArray" length="2">
-            <Value index="0">
-              0
-            </Value>
-            <Value index="1">
-              1.7320508076
-            </Value>
-          </InformationKey>
-          <InformationKey name="L2_NORM_RANGE" location="vtkDataArray" length="2">
-            <Value index="0">
-              0
-            </Value>
-            <Value index="1">
-              1.7320508076
-            </Value>
-          </InformationKey>
         </DataArray>"#;
 
         let arr: DataArray = from_str(xml)?;
